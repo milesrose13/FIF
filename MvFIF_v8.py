@@ -13,8 +13,10 @@ from numpy import linalg as LA
 from scipy.io import loadmat
 from scipy.signal import argrelextrema 
 from numba import jit,njit
+from sklearn.preprocessing import normalize
+import pyfftw
+from numpy import fft
 
-__version__='8.0'
 
 
 #WRAPPER (version unaware. To be called by MvFIF.py) 
@@ -132,13 +134,11 @@ def MvFIF(x, delta, alpha, NumSteps, ExtPoints, NIMFs, MaxInner, Xi=1.6, M=np.ar
 
     if fft =='pyfftw':
         print('using pyfftw...')
-        import pyfftw
         fftw = pyfftw.interfaces.numpy_fft.fft
         ifftw = pyfftw.interfaces.numpy_fft.ifft
         fftkwargs = {'threads':threads} if threads is not None else {}
     else:
         print('using numpy.fft...')
-        from numpy import fft
         fftw = fft.fft
         ifftw = fft.ifft
         fftkwargs = {}
@@ -438,7 +438,6 @@ def Maxmins_v3_8(x,tol = 1e-15,mode='wrap'):
 
 
 def normc(Mat,norm='l2',axis = 0):
-    from sklearn.preprocessing import normalize
     return normalize(Mat, norm=norm, axis=axis)
 
     #mods = np.sqrt(np.sum(Mat**2,axis=axis))
