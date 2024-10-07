@@ -1,12 +1,7 @@
 import laspy
 import numpy as np
-from numpy.random import normal
-import matplotlib.pyplot as plt
-
-from MvFIF_v8 import MvFIF
 from datetime import datetime
-
-from sklearn.neighbors import KDTree
+from FIF import FIF
 
 
 def load_lidar_data(file_path):
@@ -32,66 +27,6 @@ def load_lidar_data(file_path):
     return points, las_data
 
 
-def classify_ground_points(las, IMF, las_data, min_threshold=None, max_threshold=None, intensity_threshold=60):
-    """
-    Classifies ground and non-ground points based on the residual from MvFIF.
-
-    Args:
-        las (ndarray): LiDAR points (X, Y, Z).
-        IMF (ndarray): IMF from MvFIF.
-        threshold (float, optional): Threshold for elevation difference to distinguish ground from non-ground.
-            If None, computed automatically.
-
-    Returns:
-        ndarray: Array of classifications (1 for non-ground, 2 for ground).
-    """
-    num_points = las.shape[0]
-
-    # Extract the residual (trend) for Z-coordinate
-    high_freq = IMF[1]
-    high_freq_z = high_freq[2, :]  # Shape: (num_points,)
-
-    normalized_z = normalize_z(las)
-    flattened_z = IMF[-1, 2, :]
-    # Compute the absolute difference between original Z and residual Z
-    elevation_difference = np.abs(normalized_z - high_freq_z)
-    intensity = las_data.intensity
-
-    # Compute threshold if not provided
-    if min_threshold is None:
-        # Set threshold as mean plus standard deviation
-        min_threshold = elevation_difference.mean() - 1.5*elevation_difference.std()
-        max_threshold = elevation_difference.mean() + elevation_difference.std()
-    print(f"Flattened Z stats: min={flattened_z.min()}, max={flattened_z.max()}, mean={flattened_z.mean()}, std={flattened_z.std()}")
-    print(f"Elevation difference stats: min={elevation_difference.min()}, max={elevation_difference.max()}, mean={elevation_difference.mean()}, std={elevation_difference.std()}")
-    print(f"Using min threshold={min_threshold} for classification.")
-
-    # Classify points: 2 for ground (difference less than threshold), 1 for non-ground
-    flattened_thresh = np.percentile(flattened_z, 95)
-    classification = np.ones(num_points, dtype=np.uint8)  # Default to non-ground
-    ground_mask = (elevation_difference >= min_threshold) & (elevation_difference <= max_threshold) & (intensity > intensity_threshold) & (flattened_z <= flattened_thresh)
-    classification[ground_mask] = 2  #Label ground points
-    #classification = classify_by_relative_elevation(las, classification)
-
-    return classification
-
-
-def normalize_z(las):
-    """
-    Normalize the Z values of LiDAR points to the range [0, 1].
-
-    Args:
-        las (ndarray): LiDAR points (X, Y, Z).
-
-    Returns:
-        ndarray: Normalized Z values.
-    """
-    z_min = np.min(las[:, 2])
-    z_max = np.max(las[:, 2])
-
-    # Normalize Z between 0 and 1
-    normalized_z = (las[:, 2] - z_min) / (z_max - z_min)
-    return normalized_z
 
 def save_classified_las(las_data, classification, output_file):
     """
@@ -103,7 +38,6 @@ def save_classified_las(las_data, classification, output_file):
         output_file (str): Output file path for the classified LAS data.
     """
     print(f"Saving classified LiDAR data to {output_file}...")
-
     try:
         new_las = laspy.LasData(las_data.header)
         new_las.points = las_data.points.copy()
@@ -111,53 +45,96 @@ def save_classified_las(las_data, classification, output_file):
         new_las.write(output_file)
     except Exception as e:
         raise RuntimeError(f"Failed to save classified LAS data: {e}")
-
     print(f"Classified LAS file successfully saved as {output_file}.")
 
 
+def classify_points(IMF, intensity, offset):
+    num_points = len(intensity)
+    classification = np.ones(num_points, dtype=np.uint8)  # Default to non-ground
 
+    # Thresholds (adjust as needed)
+    INT_threshold = 15
+    IMF1_threshold = np.percentile(IMF[0], 50+offset)
+    IMF2_threshold = np.percentile(IMF[1], 50-offset)
+    IMF3_threshold = np.percentile(IMF[2], 50+offset)
+    IMF4_threshold = np.percentile(IMF[3], 50+offset)
 
-def main(lidar_file_path, output_file):
-    """
-    Main function to process and classify LiDAR points as ground/non-ground.
+    # Create masks
+    IMF1_mask = IMF[0] <= IMF1_threshold
+    IMF2_mask = IMF[1] >= IMF2_threshold
+    IMF3_mask = IMF[2] <= IMF3_threshold
+    IMF4_mask = IMF[3] <= IMF4_threshold
+    INT_mask = intensity >= INT_threshold
 
-    Args:
-        lidar_file_path (str): Path to the input LiDAR file.
-        output_file (str): Path to save the classified output LAS file.
-    """
-    # Load LiDAR data
-    las, las_data = load_lidar_data(lidar_file_path)
+    # Combined ground mask
+    ground_mask = IMF1_mask & IMF2_mask & IMF3_mask & IMF4_mask & INT_mask
 
-    # Parameters for MvFIF
-    delta = 0.01
-    alpha = 0.025
-    NumSteps = 10
-    ExtPoints = 5
-    NIMFs = 2 # Number of IMFs to extract
-    MaxInner = 100
+    # Update classification
+    classification[ground_mask] = 2  # Ground points
 
-    # Run MvFIF to compute IMFs and residual
-    print("Running MvFIF on the LiDAR data...")
-    start_time = datetime.now()
-    IMF, _ = MvFIF(las.T, delta, alpha, NumSteps, ExtPoints, NIMFs, MaxInner)
+    return classification
 
-    if IMF is None:
-        print("No IMFs were extracted. Exiting...")
-        return
+def main(input_las_path, output_file, ground_output_las_path):
+    # Load the LiDAR data
+    las = laspy.read(input_las_path)
+    z = las.z
+    intensity = las.intensity
 
-    elapsed_time = (datetime.now() - start_time).total_seconds()
-    print(f"MvFIF completed in {elapsed_time:.2f} seconds")
+    # Parameters for FIF (adjust as needed)
+    delta = 0.1
+    alpha = 0.5
+    num_steps = 10
+    ext_points = 5
+    n_imfs = 5
+    max_inner = 80
 
-    # Classify ground and non-ground points using the residual
-    classification = classify_ground_points(las, IMF, las_data)
+    # Step 1: Run FIF on the entire dataset
+    print("Running FIF on the entire dataset...")
+    IMF_full, _ = FIF(z, delta, alpha, num_steps, ext_points, n_imfs, max_inner)
 
-    #finished_classification = classify_by_relative_elevation(las, classification)
+    # Step 2: Classify all points
+    classification_full = classify_points(IMF_full, intensity, 35)
 
-    # Save the classified points
-    save_classified_las(las_data, classification, output_file)
+    # Step 3: Extract ground points from the first classification
+    ground_mask_first = classification_full == 2
+    ground_z = z[ground_mask_first]
+    ground_intensity = intensity[ground_mask_first]
+
+    # Step 4: Run FIF on ground points only
+    print("Running FIF on ground points...")
+    IMF_ground, _ = FIF(ground_z, delta, alpha, num_steps, ext_points, n_imfs, max_inner)
+
+    # Step 5: Classify ground points again
+    classification_ground = classify_points(IMF_ground, ground_intensity, 30)
+
+    # Step 6: Update the classification in the full dataset
+    ground_indices_first = np.where(ground_mask_first)[0]
+    classification_full[ground_indices_first] = classification_ground
+
+    # Step 7: Extract final ground points based on the second classification
+    final_ground_mask = classification_full == 2
+    ground_points = las.points[final_ground_mask]
+
+    # Step 8: Extract non-ground points from the first classification
+    non_ground_mask = classification_full == 1
+    non_ground_points = las.points[non_ground_mask]
+
+    # Step 9: Create a new LAS file with non-ground points
+    new_las = laspy.LasData(header=las.header)
+    new_las.points = non_ground_points.copy()
+    new_las.write(output_file)
+    print(f"Non-ground LAS file saved as {output_file}")
+
+    # Step 10: Append ground points to the new LAS file using LasAppender
+    with laspy.open(output_file, mode="a") as las_append:
+        las_append.append_points(ground_points)
+
+    print(f"Combined LAS file saved as {output_file}")
+
 
 
 if __name__ == "__main__":
-    lidar_file_path = 'golf.las'  # Input LiDAR file
-    output_file = 'classified_golf.las'  # Output classified LAS file
-    main(lidar_file_path, output_file)
+    lidar_file_path = 'downtown_wack.las'  # Input LiDAR file
+    output_file = 'classified_downtown_wack.las'  # Output classified LAS file
+    ground_only_output_file = 'ground_downtown_wack.las'
+    main(lidar_file_path, output_file, ground_only_output_file)
